@@ -1,73 +1,114 @@
 import streamlit as st
-import pickle
-import numpy as np
 import pandas as pd
+import numpy as np
+import requests
+import pickle
+import pvlib
+from pvlib.location import Location
 
-# --- PAGE CONFIGURATION ---
-st.set_page_config(page_title="Solar Energy Predictor", page_icon="☀️", layout="centered")
+# --- CONFIGURATION ---
+st.set_page_config(page_title="Pro Solar Estimator", page_icon="⚡", layout="wide")
 
-# --- LOAD THE TRAINED MODEL ---
-@st.cache_resource # Caches the model so it doesn't reload on every interaction
+# --- LOAD MODEL ---
+@st.cache_resource
 def load_model():
-    with open('solar_model.pkl', 'rb') as file:
-        model = pickle.load(file)
-    return model
+    return pickle.load(open('solar_model.pkl', 'rb'))
 
 try:
     model = load_model()
-except FileNotFoundError:
-    st.error("Model file not found! Please run 'train_model.py' first.")
+except:
+    st.error("Model not found. Run train_model.py first.")
     st.stop()
 
-# --- HEADER SECTION ---
-st.title("☀️ Solar Power Generation Predictor")
-st.markdown("Enter weather conditions below to predict the energy output of your solar panel system.")
-st.divider()
+# --- SIDEBAR: SYSTEM SPECS ---
+st.sidebar.header("1. Panel Configuration")
+capacity = st.sidebar.number_input("System Size (kW)", value=5.0, step=0.5)
+tilt = st.sidebar.slider("Tilt Angle (°)", 0, 90, 30, help="0=Flat, 90=Vertical Wall")
+azimuth = st.sidebar.slider("Azimuth (°)", 0, 360, 180, help="180=South, 90=East, 270=West")
 
-# --- INPUT SECTION (SIDEBAR) ---
-st.sidebar.header("User Input Parameters")
+st.sidebar.header("2. Location")
+lat = st.sidebar.number_input("Latitude", value=28.6139) # Default: New Delhi
+lon = st.sidebar.number_input("Longitude", value=77.2090)
 
-def user_input_features():
-    temp = st.sidebar.slider("Temperature (°C)", min_value=-10, max_value=50, value=30)
-    humidity = st.sidebar.slider("Humidity (%)", min_value=0, max_value=100, value=50)
-    irradiance = st.sidebar.slider("Solar Irradiance (W/m²)", min_value=0, max_value=1200, value=800)
-    cloud_cover = st.sidebar.slider("Cloud Cover (%)", min_value=0, max_value=100, value=20)
+# --- MAIN APP ---
+st.title("⚡ Advanced Solar Power Predictor")
+st.markdown(f"**Forecasting for Location:** {lat}, {lon}")
+
+if st.button("Get Live Forecast & Predict"):
     
-    data = {'Temperature': temp,
-            'Humidity': humidity,
-            'Irradiance': irradiance,
-            'Cloud_Cover': cloud_cover}
-    return pd.DataFrame(data, index=[0])
+    with st.spinner("Fetching Satellite Data & Calculating Physics..."):
+        
+        # 1. FETCH LIVE WEATHER FORECAST (Open-Meteo)
+        url = "https://api.open-meteo.com/v1/forecast"
+        params = {
+            "latitude": lat,
+            "longitude": lon,
+            "hourly": "temperature_2m,relative_humidity_2m,cloud_cover,direct_normal_irradiance,diffuse_radiation",
+            "forecast_days": 1
+        }
+        
+        try:
+            response = requests.get(url, params=params).json()
+            
+            # Organize Data
+            data = pd.DataFrame({
+                'time': pd.to_datetime(response['hourly']['time']),
+                'temp': response['hourly']['temperature_2m'],
+                'humidity': response['hourly']['relative_humidity_2m'],
+                'cloud': response['hourly']['cloud_cover'],
+                'dni': response['hourly']['direct_normal_irradiance'],
+                'dhi': response['hourly']['diffuse_radiation']
+            })
+            
+        except Exception as e:
+            st.error("Error fetching weather data. Check internet connection.")
+            st.stop()
 
-input_df = user_input_features()
+        # 2. PHYSICS ENGINE (Calculate "Plane of Array" Irradiance)
+        # This converts "Sun in Sky" to "Sun on Panel" based on user inputs
+        site = Location(lat, lon)
+        solar_pos = site.get_solarposition(data['time'])
+        
+        poa_data = pvlib.irradiance.get_total_irradiance(
+            surface_tilt=tilt,
+            surface_azimuth=azimuth,
+            dni=data['dni'],
+            ghi=data['dni']*0 + data['dhi'], # Simplification
+            dhi=data['dhi'],
+            solar_zenith=solar_pos['apparent_zenith'],
+            solar_azimuth=solar_pos['azimuth']
+        )
+        
+        data['Effective_Irradiance'] = poa_data['poa_global']
 
-# --- DISPLAY INPUTS ---
-st.subheader("Current Weather Conditions")
-col1, col2, col3, col4 = st.columns(4)
-col1.metric("Temperature", f"{input_df['Temperature'][0]} °C")
-col2.metric("Humidity", f"{input_df['Humidity'][0]} %")
-col3.metric("Irradiance", f"{input_df['Irradiance'][0]} W/m²")
-col4.metric("Cloud Cover", f"{input_df['Cloud_Cover'][0]} %")
+        # 3. AI ENGINE (Predict Output)
+        # We scale the prediction based on the user's system size (Capacity)
+        # The model was trained on a 5kW system, so we scale proportionally.
+        
+        features = data[['Effective_Irradiance', 'temp', 'humidity', 'cloud']]
+        features.columns = ['Effective_Irradiance', 'temperature', 'humidity', 'cloud_cover'] # Rename to match training
+        
+        raw_prediction = model.predict(features)
+        
+        # Scale prediction: (Prediction / 5kW_Base) * User_Capacity
+        scaled_prediction = (raw_prediction / 5.0) * capacity
+        
+        data['Predicted_Power_kW'] = scaled_prediction
 
-# --- PREDICTION SECTION ---
-if st.button("Predict Power Output"):
-    prediction = model.predict(input_df)
-    output = round(prediction[0], 2)
-    
-    st.divider()
-    st.subheader("Prediction Result")
-    
-    # Visualizing the result with a gauge-style metric
-    st.success(f"Estimated Power Generation: **{output} Watts**")
-    
-    # Contextual feedback
-    if output > 300:
-        st.info("✅ Excellent conditions for high energy generation.")
-    elif output > 100:
-        st.warning("⚠️ Moderate generation conditions.")
-    else:
-        st.error("❌ Poor conditions. Very low energy generation expected.")
-
-# --- FOOTER ---
-st.divider()
-st.caption("Built with Python & Streamlit | Solar Prediction Project")
+        # --- DISPLAY RESULTS ---
+        # Summary Metrics
+        total_energy = data['Predicted_Power_kW'].sum()
+        peak_power = data['Predicted_Power_kW'].max()
+        
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Total Energy (Today)", f"{total_energy:.1f} kWh")
+        col2.metric("Peak Power", f"{peak_power:.1f} kW")
+        col3.metric("Efficiency Score", f"{100 - data['cloud'].mean():.0f}%")
+        
+        # Chart
+        st.subheader("Hourly Power Generation Curve")
+        st.area_chart(data.set_index('time')['Predicted_Power_kW'])
+        
+        # Data Table
+        with st.expander("View Detailed Hourly Data"):
+            st.dataframe(data[['time', 'temp', 'Effective_Irradiance', 'Predicted_Power_kW']])
