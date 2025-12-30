@@ -6,106 +6,107 @@ import pickle
 import pvlib
 from pvlib.location import Location
 
-# --- PAGE CONFIGURATION ---
-st.set_page_config(page_title="Solar AI Predictor", page_icon="☀️", layout="wide")
+# --- CONFIG ---
+st.set_page_config(page_title="Solar AI", page_icon="⚡")
 
-# --- 1. LOAD THE TRAINED MODEL ---
+# --- LOAD MODEL ---
 @st.cache_resource
 def load_model():
-    try:
-        return pickle.load(open('solar_model.pkl', 'rb'))
-    except FileNotFoundError:
-        st.error("⚠️ Model file 'solar_model.pkl' not found. Please run 'train_model.py' first.")
-        st.stop()
+    return pickle.load(open('solar_model.pkl', 'rb'))
 
-model = load_model()
+try:
+    model = load_model()
+except:
+    st.error("Model missing. Run 'train_model.py' first!")
+    st.stop()
 
-# --- SIDEBAR: USER INPUTS ---
-st.sidebar.header("⚙️ System Configuration")
-capacity_kw = st.sidebar.number_input("System Capacity (kW)", value=5.0, step=0.5)
-tilt_angle = st.sidebar.slider("Panel Tilt Angle (°)", 0, 90, 30)
-azimuth_angle = st.sidebar.slider("Azimuth Angle (°)", 0, 360, 180)
+# --- SIDEBAR ---
+st.sidebar.header("⚙️ Configuration")
+capacity = st.sidebar.number_input("System Size (kW)", value=5.0)
+tilt = st.sidebar.slider("Tilt Angle", 0, 90, 30)
+azimuth = st.sidebar.slider("Azimuth (180=South)", 0, 360, 180)
 
 st.sidebar.header("📍 Location")
-lat = st.sidebar.number_input("Latitude", value=28.6139, format="%.4f")
-lon = st.sidebar.number_input("Longitude", value=77.2090, format="%.4f")
+# Default: New Delhi
+lat = st.sidebar.number_input("Latitude", value=28.6139) 
+lon = st.sidebar.number_input("Longitude", value=77.2090)
 
-# --- MAIN DASHBOARD ---
-st.title("☀️ Solar Power AI Predictor")
-st.markdown(f"**Forecasting for:** {lat}, {lon}")
+# --- MAIN LOGIC ---
+st.title("⚡ Solar Power Predictor (Fixed)")
 
-if st.button("🚀 Get Live Forecast & Predict"):
-    
-    with st.spinner("Connecting to Weather Satellites..."):
-        try:
-            # 1. FETCH LIVE WEATHER FORECAST
-            # FIXED: Added 'shortwave_radiation' to get GHI correctly
-            url = "https://api.open-meteo.com/v1/forecast"
-            params = {
-                "latitude": lat,
-                "longitude": lon,
-                "hourly": "temperature_2m,relative_humidity_2m,cloud_cover,direct_normal_irradiance,diffuse_radiation,shortwave_radiation",
-                "timezone": "auto",
-                "forecast_days": 1
-            }
-            
-            response = requests.get(url, params=params)
-            data_json = response.json()
-            
-            # Create DataFrame
-            df = pd.DataFrame({
-                'time': pd.to_datetime(data_json['hourly']['time']),
-                'temperature': data_json['hourly']['temperature_2m'],
-                'humidity': data_json['hourly']['relative_humidity_2m'],
-                'cloud_cover': data_json['hourly']['cloud_cover'],
-                'dni': data_json['hourly']['direct_normal_irradiance'], # Direct Sun
-                'dhi': data_json['hourly']['diffuse_radiation'],      # Diffuse (Cloud) Light
-                'ghi': data_json['hourly']['shortwave_radiation']     # Global Light (FIX)
-            })
+if st.button("Predict Now"):
+    with st.spinner("Fetching Data & Fixing Timezones..."):
+        
+        # 1. Get Weather (including Shortwave Radiation for GHI)
+        url = "https://api.open-meteo.com/v1/forecast"
+        params = {
+            "latitude": lat,
+            "longitude": lon,
+            "hourly": "temperature_2m,relative_humidity_2m,cloud_cover,direct_normal_irradiance,diffuse_radiation,shortwave_radiation",
+            "timezone": "auto", # This asks API for Local Time
+            "forecast_days": 1
+        }
+        resp = requests.get(url, params=params).json()
+        
+        # 2. Process Timezone Correctly
+        # Open-Meteo returns local time string (e.g., "2023-12-30T12:00")
+        # We must tell Python that this IS 'Asia/Kolkata' (or whatever local tz is)
+        local_tz = resp.get('timezone', 'UTC')
+        
+        df = pd.DataFrame({
+            'time': pd.to_datetime(resp['hourly']['time']),
+            'temp': resp['hourly']['temperature_2m'],
+            'humidity': resp['hourly']['relative_humidity_2m'],
+            'cloud': resp['hourly']['cloud_cover'],
+            'dni': resp['hourly']['direct_normal_irradiance'],
+            'dhi': resp['hourly']['diffuse_radiation'],
+            'ghi': resp['hourly']['shortwave_radiation'] # CRITICAL FIX
+        })
+        
+        # Localize the time so PVLib knows where the sun is
+        df['time'] = df['time'].dt.tz_localize(local_tz, ambiguous='NaT', nonexistent='shift_forward')
+        
+        # 3. Calculate Physics (Sun Position)
+        site = Location(lat, lon, tz=local_tz)
+        sol_pos = site.get_solarposition(df['time'])
+        
+        # DEBUG: Check Sun Altitude
+        # If Altitude is < 0, it is Night.
+        df['Sun_Altitude'] = sol_pos['apparent_elevation'].values
+        
+        poa = pvlib.irradiance.get_total_irradiance(
+            surface_tilt=tilt,
+            surface_azimuth=azimuth,
+            dni=df['dni'],
+            ghi=df['ghi'],
+            dhi=df['dhi'],
+            solar_zenith=sol_pos['apparent_zenith'],
+            solar_azimuth=sol_pos['azimuth']
+        )
+        
+        df['Effective_Irradiance'] = poa['poa_global']
+        
+        # 4. AI Prediction
+        # Rename columns to match model
+        X = df[['Effective_Irradiance', 'temp', 'humidity', 'cloud']]
+        X.columns = ['Effective_Irradiance', 'temperature', 'humidity', 'cloud_cover']
+        
+        pred = model.predict(X)
+        df['Predicted_Power_kW'] = (pred / 5.0) * capacity
+        df['Predicted_Power_kW'] = df['Predicted_Power_kW'].clip(lower=0)
 
-            # 2. PHYSICS ENGINE
-            # We need to correctly handle timezones for the Sun Position
-            tz_str = data_json.get('timezone', 'UTC')
-            df['time'] = df['time'].dt.tz_localize(tz_str)
-            
-            site = Location(lat, lon, tz=tz_str)
-            solar_pos = site.get_solarposition(df['time'])
-            
-            # FIXED: Passed the correct 'ghi' to the engine
-            poa_data = pvlib.irradiance.get_total_irradiance(
-                surface_tilt=tilt_angle,
-                surface_azimuth=azimuth_angle,
-                dni=df['dni'],
-                ghi=df['ghi'], # Now using real GHI from API
-                dhi=df['dhi'],
-                solar_zenith=solar_pos['apparent_zenith'],
-                solar_azimuth=solar_pos['azimuth']
-            )
-            
-            df['Effective_Irradiance'] = poa_data['poa_global']
-            
-            # 3. AI ENGINE
-            features = df[['Effective_Irradiance', 'temperature', 'humidity', 'cloud_cover']]
-            
-            raw_prediction_kw = model.predict(features)
-            
-            # Scale result
-            df['Predicted_Power_kW'] = (raw_prediction_kw / 5.0) * capacity_kw
-            df['Predicted_Power_kW'] = df['Predicted_Power_kW'].clip(lower=0)
+        # --- DISPLAY ---
+        total = df['Predicted_Power_kW'].sum()
+        peak = df['Predicted_Power_kW'].max()
+        
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Total Energy", f"{total:.2f} kWh")
+        col2.metric("Peak Power", f"{peak:.2f} kW")
+        col3.metric("Timezone Used", local_tz)
 
-            # --- DISPLAY RESULTS ---
-            total_energy_kwh = df['Predicted_Power_kW'].sum()
-            peak_power_kw = df['Predicted_Power_kW'].max()
-            
-            col1, col2, col3 = st.columns(3)
-            col1.metric("Total Energy", f"{total_energy_kwh:.2f} kWh")
-            col2.metric("Peak Power", f"{peak_power_kw:.2f} kW")
-            col3.metric("Avg Cloud Cover", f"{df['cloud_cover'].mean():.0f}%")
-            
-            st.area_chart(df.set_index('time')['Predicted_Power_kW'])
-            
-            with st.expander("View Data"):
-                st.dataframe(df)
-                
-        except Exception as e:
-            st.error(f"Error: {e}")
+        st.area_chart(df.set_index('time')['Predicted_Power_kW'])
+        
+        # Debug Table to prove Sun Altitude
+        with st.expander("🔍 View Debug Data (Check Sun Altitude)"):
+            st.write("If 'Sun_Altitude' is negative, it means Night.")
+            st.dataframe(df[['time', 'Sun_Altitude', 'ghi', 'Predicted_Power_kW']])
